@@ -25,7 +25,7 @@ and DiskScanner classes with subclasses implementing the missing methods."""
 
 import logging
 import os.path
-from typing import Optional, Dict, Set, List, Tuple, Union, Any, Iterator
+from typing import Mapping, Optional, Dict, Set, List, Tuple, Union, Any, Iterator
 from datetime import datetime
 
 from .constants import sector_size
@@ -262,6 +262,6 @@ class DiskScanner(object):
         """Feed a new sector."""
         raise NotImplementedError
 
-    def get_partitions(self) -> Dict[int, Partition]:
+    def get_partitions(self) -> Mapping[int, Partition]:
         """Get a list of the found partitions."""
         raise NotImplementedError

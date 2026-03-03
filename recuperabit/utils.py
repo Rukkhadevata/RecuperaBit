@@ -25,7 +25,8 @@ import pprint
 import string
 import sys
 import time
-from typing import TYPE_CHECKING, Any, Iterable, Optional, List, Dict, Tuple, Union, Callable
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, List, Dict, Tuple, Union, Callable
+import typing
 import unicodedata
 import io
 
@@ -42,6 +43,15 @@ ascii_printable: set[str] = set(string.printable[:-5])
 if TYPE_CHECKING:
     from .fs.core_types import File, Partition
 
+
+
+@typing.overload
+def sectors(image: io.BufferedReader, offset: int, size: int, bsize: int = sector_size, fill: Literal[True] = True) -> bytearray:
+    pass
+
+@typing.overload
+def sectors(image: io.BufferedReader, offset: int, size: int, bsize: int = sector_size, fill: bool = True) -> Optional[bytearray]:
+    pass
 
 def sectors(image: io.BufferedReader, offset: int, size: int, bsize: int = sector_size, fill: bool = True) -> Optional[bytearray]:
     """Read from a file descriptor."""

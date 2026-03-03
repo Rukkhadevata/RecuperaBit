@@ -24,7 +24,7 @@ including MFT entries and directory indexes."""
 
 import logging
 from collections import Counter
-from typing import Any, Dict, List, Optional, Tuple, Union, Iterator, Set
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union, Iterator, Set
 
 from .constants import max_sectors, sector_size
 from .core_types import DiskScanner, File, Partition
@@ -67,7 +67,7 @@ def best_name(entries: List[Tuple[int, str]]) -> Optional[str]:
     return name if len(name) else None
 
 
-def parse_mft_attr(attr: bytes) -> Tuple[Dict[str, Any], Optional[str]]:
+def parse_mft_attr(attr: bytes, global_offset: int) -> Tuple[Dict[str, Any], Optional[str]]:
     """Parse the contents of a MFT attribute."""
     header = unpack(attr, attr_header_fmt)
     attr_type = header['type']
@@ -90,6 +90,12 @@ def parse_mft_attr(attr: bytes) -> Tuple[Dict[str, Any], Optional[str]]:
     if not header['non_resident'] and name in attr_types_fmt:
         size = header['content_size']
         data = unpack(content[:size], attr_types_fmt[name])
+        if '$FILE_NAME' == name:
+            data['name_content_offset'] += header['content_off'] + global_offset
+        elif '$INDEX_ROOT' == name:
+            data['records_offset'] += header['content_off'] + global_offset
+            for record in data['records']:
+                record['$FILE_NAME']['name_content_offset'] += 16 + header['content_off'] + global_offset # 16 from $INDEX_ROOT.records
         header['content'] = data
 
     return header, name
@@ -103,16 +109,18 @@ def _apply_fixup_values(header: Dict[str, Any], entry: bytearray) -> None:
         entry[pos-2:pos] = entry[offset + 2*i:offset + 2*(i+1)]
 
 
-def _attributes_reader(entry: bytes, offset: int) -> Dict[str, Any]:
+def _attributes_reader(entry: bytes, offset: int, global_offset: int) -> Dict[str, Any]:
     """Read every attribute."""
     attributes = {}
     while offset < len(entry) - 16:
         try:
-            attr, name = parse_mft_attr(entry[offset:])
+            attr, name = parse_mft_attr(entry[offset:], offset + global_offset)
         except TypeError:
             # The attribute was broken, we need to terminate here
+            logging.exception('')
             return attributes
         attr['dump_offset'] = offset
+
         if attr['length'] == 0:
             # End of attribute list
             break
@@ -134,7 +142,7 @@ def _attributes_reader(entry: bytes, offset: int) -> Dict[str, Any]:
     return attributes
 
 
-def parse_file_record(entry: bytes) -> Dict[str, Any]:
+def parse_file_record(entry: bytes, offset: int) -> Dict[str, Any]:
     """Parse the contents of a FILE record (MFT entry)."""
     header = unpack(entry, entry_fmt)
     if (header['size_alloc'] is None or
@@ -149,13 +157,13 @@ def parse_file_record(entry: bytes) -> Dict[str, Any]:
 
     _apply_fixup_values(header, entry)
 
-    attributes = _attributes_reader(entry, header['off_first'])
+    attributes = _attributes_reader(entry, header['off_first'], offset)
     header['valid'] = True
     header['attributes'] = attributes
     return header
 
 
-def parse_indx_record(entry: bytes) -> Dict[str, Any]:
+def parse_indx_record(entry: bytes, global_offset: int) -> Dict[str, Any]:
     """Parse the contents of a INDX record (directory index)."""
     header = unpack(entry, indx_fmt)
 
@@ -179,6 +187,8 @@ def parse_indx_record(entry: bytes) -> Dict[str, Any]:
                 )
             except (UnicodeDecodeError, TypeError):  # Invalid file name or invalid name length
                 break
+            if entry_data['$FILE_NAME'] != {}:
+                entry_data['$FILE_NAME']['name_content_offset'] += offset + global_offset + 16
             # Perform checks to avoid false positives
             name_ok = file_name['name'] is not None
             namespace_ok = 0 <= file_name['namespace'] <= 3
@@ -247,7 +257,7 @@ def _integrate_attribute_list(parsed: Dict[str, Any], part: 'NTFSPartition', ima
         for index in entries_by_type[num]:
             real_pos = mft_pos + index * FILE_size
             dump = sectors(image, real_pos, FILE_size)
-            child_parsed = parse_file_record(dump)
+            child_parsed = parse_file_record(dump, real_pos*sector_size)
             if 'attributes' not in child_parsed:
                 continue
             # Update the main entry (parsed)
@@ -379,6 +389,45 @@ class NTFSFile(File):
                     yield bytes(partial)
             vcn = attr['end_VCN'] + 1
 
+    def content_iterator_with_position(self, partition: 'NTFSPartition', image: Any, datas: List[Dict[str, Any]]) -> Iterator[tuple[int, int]]:
+        """Return an iterator for the offset and size of each runlist entry."""
+        vcn = 0
+        spc = partition.sec_per_clus
+        for attr in datas:
+            diff = attr['start_VCN'] - vcn
+            if diff > 0:
+                # We do not try to fill with zeroes as this might produce huge useless files
+                logging.warning(
+                    u'Missing part for {}, {} clusters skipped'.format(self, diff)
+                )
+                vcn += diff
+
+            clusters_pos = 0
+            size = attr['real_size']
+
+            if 'runlist' not in attr:
+                logging.error(
+                    u'Cannot restore {}, missing runlist'.format(self)
+                )
+                break
+
+            for entry in attr['runlist']:
+                length = min(entry['length'] * spc * sector_size, size)
+                size -= length
+                # Sparse runlist
+                if entry['offset'] is None:
+                    while length > 0:
+                        amount = min(max_sectors*sector_size, length)
+                        length -= amount
+                        # yield b'\x00' * amount
+                    continue
+                # Normal runlists
+                clusters_pos += entry['offset']
+                real_pos = clusters_pos * spc + partition.offset
+                position = real_pos*sector_size
+                yield position, length
+            vcn = attr['end_VCN'] + 1
+
     def get_content(self, partition: 'NTFSPartition') -> Optional[Union[bytes, Iterator[bytes]]]:
         """Extract the content of the file.
 
@@ -389,7 +438,7 @@ class NTFSFile(File):
 
         image = DiskScanner.get_image(partition.scanner)
         dump = sectors(image, File.get_offset(self), FILE_size)
-        parsed = parse_file_record(dump)
+        parsed = parse_file_record(dump, self.offset*sector_size)
 
         if not parsed['valid'] or 'attributes' not in parsed:
             logging.error(u'Invalid MFT entry for {}'.format(self))
@@ -476,6 +525,7 @@ class NTFSScanner(DiskScanner):
         self.indx_list: Optional[SparseList[int]] = None
         self.found_boot: List[int] = []
         self.found_spc: List[int] = []
+        self.delete_plan: list[dict] = []
 
     def feed(self, index: int, sector: bytes) -> Optional[str]:
         """Feed a new sector."""
@@ -623,7 +673,7 @@ class NTFSScanner(DiskScanner):
         img = DiskScanner.get_image(self)
         for position in read_again:
             dump = sectors(img, position, INDX_size)
-            entries = parse_indx_record(dump)['entries']
+            entries = parse_indx_record(dump, position*sector_size)['entries']
             self.add_indx_entries(entries, part)
 
     def add_from_attribute_list(self, parsed: Dict[str, Any], part: NTFSPartition, offset: int) -> None:
@@ -656,7 +706,7 @@ class NTFSScanner(DiskScanner):
             if node is None or node.is_ghost:
                 position = mirrpos + i * FILE_size
                 dump = sectors(img, position, FILE_size)
-                parsed = parse_file_record(dump)
+                parsed = parse_file_record(dump, position*sector_size)
                 if parsed['valid'] and '$FILE_NAME' in parsed['attributes']:
                     node = NTFSFile(parsed, position)
                     part.add_file(node)
@@ -695,14 +745,29 @@ class NTFSScanner(DiskScanner):
             self.add_from_indx_allocation(parsed, part)
 
     def get_partitions(self) -> Dict[int, NTFSPartition]:
-        """Get a list of the found partitions."""
+        """Get a list of the found partitions.
+        1. 遍历 FILE record，去掉没有$FILE_NAME attr的，根据FILE record position和record_n分配partition，
+        1.1 如果是文件，所有$DATA加入到partition中
+        1.2 如果是文件夹，所有$INDEX_ROOT提到的children以ghost形式加入到partition中
+        1.3 有$ATTRIBUTE_LIST或$INDEX_ALLOCATION的，记录到self.parsed_file_review一会儿看
+        2. 遍历 INDX record，得到文件列表和文件夹，保存到self.parsed_indx一会儿看
+        3. 遍历 BOOT record，拿到sectors_per_cluster、MFT_addr(相对于BOOT record的位置，一般在分区1/3处)、MFTmirr_addr(相对于BOOT record的位置，一般在第6扇区)、sectors(总共扇区数，看查找逻辑这个BOOT record可能位于分区末尾，sectors应该是不包含末尾BOOT record的)，将能对得上MFT_addr的partition设置为可恢复，并设置该partition的全局offset，也就是将BOOT record 的起始位置作为offset，这个offset很重要，所有计算runlist的地方都需要使用，比如一会儿的_integrate_attribute_list
+        4. 遍历已找到的partitions
+        4.1 常见情况：如果当前partition在BOOT record那里中被设置了mftmirr_pos，则遍历mirror的0~3号文件，如果当前partition里没有这个文件，则将mirror里的File加到当前partition里，然后将mirror所在的partition删掉，遍历后续partition时如果遇到mirror就跳过。
+        4.2 如果当前partition没有设置mftmirr_pos，会尝试在当前partition获取1号FILE record，即mftmirr，取其中的$DATA[0]['runlist][0]['offset']作为mftmirr_pos的cluster_pos，一般会得到2号cluster，但是如果这个partition之前没被设置sec_per_clus，这一步会跳过，因为没法知道具体是哪个扇区。所以说，如果先遍历到的是mirror partition本身的话，这里就跳过了，因为BOOT record那里只给MFT设置了这个值，mirror确实没有
+        5. finalize_reconstruction
+        5.1 先要确保partition.offset已经设置，如果没有设置，尝试寻找这个offset，这里是我最看不懂的部分了，只接问AI。
+        5.2 执行add_from_attribute_list，如果那里面有$DATA，遍历，把ads加进partition里，这里没有处理unnamed $DATA，也许unnamed $DATA必定在base_record里吧
+        5.3 add_from_indx_allocation，遍历所有带$INDEX_ALLOCATION的FILE record，遍历$INDEX_ALLOCATION的runlist，拿到offset后从self.parsed_indx取信息，拿到children集合，如果发现未在当前part.files出现，则再次解析INDX record(步骤2已经解析过一次，将节点父子关系的record_n存到self.parsed_indx了，这里再次解析是为了拿到$FILE_NAME，添加ghost file)
+        6.  Merge pieces from fragmented MFT，我还没细看，因我当前的测试用例不满足MFT runlist有多个entry
+        """
         partitioned_files: Dict[int, NTFSPartition] = {}
         img = DiskScanner.get_image(self)
 
         logging.info('Parsing MFT entries')
         for position in self.found_file:
             dump = sectors(img, position, FILE_size)
-            parsed = parse_file_record(dump)
+            parsed = parse_file_record(dump, position*sector_size)
             attrs = parsed.get('attributes', {})
             if not parsed['valid'] or '$FILE_NAME' not in attrs:
                 continue
@@ -737,7 +802,7 @@ class NTFSScanner(DiskScanner):
         logging.info('Parsing INDX records')
         for position in self.found_indx:
             dump = sectors(img, position, INDX_size)
-            parsed = parse_indx_record(dump)
+            parsed = parse_indx_record(dump, position*sector_size)
             if not parsed['valid']:
                 continue
 
@@ -793,7 +858,7 @@ class NTFSScanner(DiskScanner):
                 else:
                     # Infer MFT mirror position
                     dump = sectors(img, entry.offset, FILE_size)
-                    mirror = parse_file_record(dump)
+                    mirror = parse_file_record(dump, entry.offset*sector_size)
                     if (mirror['valid'] and 'attributes' in mirror and
                             '$DATA' in mirror['attributes']):
                         datas = mirror['attributes']['$DATA']
@@ -856,7 +921,7 @@ class NTFSScanner(DiskScanner):
             if entry is None or part.sec_per_clus is None:
                 continue
             dump = sectors(img, entry.offset, FILE_size)
-            parsed = parse_file_record(dump)
+            parsed = parse_file_record(dump, entry.offset*sector_size)
             if not parsed['valid'] or 'attributes' not in parsed:
                 continue
 
@@ -907,3 +972,204 @@ class NTFSScanner(DiskScanner):
                     size += entry['length']
 
         return partitioned_files
+
+    def generate_wipe_plan(self):
+        ret: list[dict[str, str|int]] = []
+        parts = self.get_partitions()
+        if len(parts) == 1:
+            part = next(iter(parts.values()))
+        else:
+            shorthands = list(enumerate(parts))
+            for idx, part in shorthands:
+                print(f'[{idx}] {part}')
+                if part == 6324224:
+                    part = parts[part]
+                    break
+            else:
+                idx = int(input('选择分区>'))
+                part = parts[shorthands[idx][1]]
+        part.sec_per_clus = 8
+        part.offset = 6324224
+        image = self.get_image(self)
+        for index, file in part.files.items():
+            if not isinstance(file, NTFSFile):
+                raise ValueError(f"需要NTFSFile，但得到{type(file)}")
+            dump = sectors(image, file.get_offset(), FILE_size)
+            parsed = parse_file_record(dump, file.get_offset()*sector_size)
+            attrs = parsed['attributes']
+            if ('$ATTRIBUTE_LIST' in attrs):
+                _integrate_attribute_list(parsed, part, image)
+
+            if file.is_directory:
+                if "$INDEX_ROOT" in attrs:
+                    for index_root in attrs['$INDEX_ROOT']:
+                        for index_ent in index_root['content']['records']:
+                            file_name = index_ent['$FILE_NAME']
+                            ret.append({
+                                'type': 'FILE-$INDEX_ROOT-$FILE_NAME',
+                                'offset': file_name['name_content_offset'],
+                                'length': file_name['name_content_bytes_len'],
+                                'desc': f'{file_name['name']}',
+                            })
+                continue
+            if '$DATA' not in attrs:
+                attrs['$DATA'] = []
+            datas = [d for d in attrs['$DATA'] if d['name'] == file.ads]
+            if not len(datas):
+                if not file.is_directory:
+                    logging.error(u'Cannot restore $DATA attribute(s) '
+                                'for {}'.format(self))
+                continue
+
+            # TODO implemented compressed attributes
+            for d in datas:
+                if d['flags'] & 0x01:
+                    raise ValueError(u'Cannot restore compressed $DATA attribute(s) '
+                                'for {}'.format(self))
+                elif d['flags'] & 0x4000:
+                    logging.warning(u'Found encrypted $DATA attribute(s) '
+                                    'for {}'.format(self))
+
+            # Handle resident file content
+            if len(datas) == 1 and not datas[0]['non_resident']:
+                single = datas[0]
+                start = single['dump_offset'] + single['content_off']
+                end = start + single['content_size']
+                # content = dump[start:end]
+                ret.append({
+                    'type': "FILE-$DATA",
+                    "offset": start + file.get_offset()*sector_size,
+                    "length": single['content_size'],
+                    "desc": f"{index} {file} resident",
+                })
+            else:
+                if part.sec_per_clus is None:
+                    raise ValueError(u'Cannot restore non-resident $DATA '
+                                'attribute(s) for {}'.format(self))
+                non_resident = sorted(
+                    (d for d in datas if d['non_resident']),
+                    key=lambda x: x['start_VCN']
+                )
+                if len(non_resident) != len(datas):
+                    logging.warning(
+                        u'Found leftover resident $DATA attributes for '
+                        '{}'.format(self)
+                    )
+                for idx, (offset, length) in enumerate(file.content_iterator_with_position(part, image, non_resident)):
+                    ret.append({
+                        'type': "File-$DATA",
+                        "offset": offset,
+                        "length": length,
+                        "desc": f"{index} {file} runlist-{idx}",
+                    })
+            if "$FILE_NAME" in attrs:
+                for i, filename in enumerate(attrs["$FILE_NAME"]):
+                    content = filename['content']
+                    ret.append({
+                        'type': "FILE-$FILE_NAME",
+                        "offset": content['name_content_offset'],
+                        "length": content['name_content_bytes_len'],
+                        "desc": f"{index} {file} filename - {i}",
+                    })
+
+        for position in self.found_indx:
+            dump = sectors(image, position, INDX_size)
+            parsed = parse_indx_record(dump, position*sector_size)
+            if not parsed['valid']:
+                continue
+            entries = parsed['entries']
+            for entry in entries:
+                ret.append({
+                    'type': "INDX-$FILE_NAME",
+                    "offset": entry['$FILE_NAME']['name_content_offset'],
+                    "length": entry['$FILE_NAME']['name_content_bytes_len'],
+                    "desc": f"{position} {entry['$FILE_NAME']['name']} filename",
+                })
+
+        import os
+        # open('123', 'rb+').seek
+        # open('123', 'rb+').tell
+        # image.seek(-513, os.SEEK_END)
+        # print(f'end: {image.tell()}')
+        for ent in ret:
+            ent_type = ent['type']
+            offset = ent['offset']
+            length = ent['length']
+
+            # 读取原始数据
+            print(f'seek to {offset} reading {length} bytes')
+            image.seek(offset-(offset%512))
+            image.read((offset%512))
+            # image.seek(offset)
+            data = image.read(min(length, 1024*1024))
+
+            preview = None
+
+            if '$FILE_NAME' in ent_type:
+                # 用 utf16 解码
+                try:
+                    preview = data.decode('utf-16-le')
+                except UnicodeDecodeError:
+                    try:
+                        preview = data.decode('utf-16-be')
+                    except UnicodeDecodeError:
+                        preview = data
+            elif '$DATA' in ent_type:
+                # 处理 $DATA 属性
+                # 如果长度超过 100，只取前 100 字节
+                if length > 100:
+                    data = data[:100]
+
+                # 尝试用 utf8、utf16、gb18030 解码
+                decoded = None
+                for encoding in ('utf-8', 'utf-16-le', 'gb18030'):
+                    try:
+                        decoded = data.decode(encoding)
+                        break
+                    except (UnicodeDecodeError, AttributeError):
+                        continue
+
+                if decoded is not None:
+                    preview = decoded
+                else:
+                    # 所有解码都失败，说明是二进制
+                    preview = data
+
+            ent['preview'] = preview
+
+        return ret
+
+    def execute_wipe_plan(self, plan: list[dict[str, str|int]]) -> None:
+        """Execute the wipe plan by writing zeros to the specified positions."""
+        from pprint import pprint
+        pprint(plan)
+
+        confirm = input('确认删除以上所有数据? 请输入 "Yes" 确认: ')
+        if confirm != 'Yes':
+            print('取消删除')
+            return
+
+        image = self.get_image(self)
+        name = image.name
+        print(image.mode)
+        for ent in plan:
+            offset = ent['offset']
+            length = ent['length']
+            now_at = 0
+            image = open(name, 'r+b')
+            off = offset%512
+            image.seek(offset-off)
+            image.read(off)
+            now_at = offset
+            print(f'seek to {offset} write {length} bytes')
+            # image.seek(offset)
+            remains = length
+            while remains > 0:
+                this_time = min(remains, 4096)
+                print('write', this_time, 'at', now_at)
+                try:
+                    image.write(b'\x00' * this_time)
+                except OSError as e:
+                    print(f'error at {now_at} try again')
+                remains -= this_time
+                now_at += this_time

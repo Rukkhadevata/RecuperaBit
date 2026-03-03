@@ -23,6 +23,7 @@
 import argparse
 import codecs
 import itertools
+import json
 import locale
 import logging
 import os.path
@@ -69,10 +70,13 @@ commands = (
     ('locate <part#> <text>', 'Print all file paths that match a string'),
     ('traceback <part#> <file>', 'Print ids and paths for all ancestors of <file>'),
     ('merge <part#> <part#>', 'Merge the two partitions into the first one'),
+    ('generate_wipe_plan', 'Generate wipe plan for NTFS partition'),
+    ('execute_wipe_plan', 'Execute the wipe plan to erase data'),
     ('quit', 'Close the program')
 )
 
 rebuilt = set()
+wipe_plan_storage: dict[int, list] = {}  # Store wipe plans by scanner id
 
 
 def list_parts(parts, shorthands, test):
@@ -102,7 +106,7 @@ def check_valid_part(num, parts, shorthands, rebuild=True):
     return None
 
 
-def interpret(cmd, arguments, parts: dict[int, 'Partition'], shorthands, outdir):
+def interpret(cmd, arguments, parts: dict[int, 'Partition'], shorthands, outdir, scanners):
     """Perform command required by user."""
     if cmd == 'help':
         print('Available commands:')
@@ -260,6 +264,44 @@ def interpret(cmd, arguments, parts: dict[int, 'Partition'], shorthands, outdir)
         list_parts(parts, shorthands, lambda x: not x.recoverable)
     elif cmd == 'allparts':
         list_parts(parts, shorthands, lambda x: True)
+    elif cmd == 'generate_wipe_plan':
+        if len(arguments) != 1:
+            print('Wrong number of parameters!')
+        else:
+            part = check_valid_part(arguments[0], parts, shorthands)
+            if part is not None:
+                # Find the scanner that owns this partition from scanners list
+                scanner = None
+                for s in scanners:
+                    if part in s.get_partitions().values():
+                        scanner = s
+                        break
+                if scanner is None:
+                    print('Scanner not found for this partition!')
+                else:
+                    ret = scanner.generate_wipe_plan()
+                    wipe_plan_storage[id(scanner)] = ret
+                    print(f'Wipe plan generated with {len(ret)} entries')
+    elif cmd == 'execute_wipe_plan':
+        if len(arguments) != 1:
+            print('Wrong number of parameters!')
+        else:
+            part = check_valid_part(arguments[0], parts, shorthands)
+            if part is not None:
+                # Find the scanner that owns this partition from scanners list
+                scanner = None
+                for s in scanners:
+                    if part in s.get_partitions().values():
+                        scanner = s
+                        break
+                if scanner is None:
+                    print('Scanner not found for this partition!')
+                else:
+                    plan = wipe_plan_storage.get(id(scanner))
+                    if plan is None:
+                        print('No wipe plan found! Run generate_wipe_plan first.')
+                    else:
+                        scanner.execute_wipe_plan(plan)
     elif cmd == 'quit':
         exit(0)
     else:
@@ -298,7 +340,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        image = open(args.path, 'rb')
+        image = open(args.path, 'rb+')
     except IOError:
         logging.error('Unable to open image file!')
         exit(1)
@@ -383,7 +425,7 @@ def main():
             exit(0)
         cmd = command[0]
         arguments = command[1:]
-        interpret(cmd, arguments, parts, shorthands, args.outputdir)
+        interpret(cmd, arguments, parts, shorthands, args.outputdir, scanners)
 
 if __name__ == '__main__':
     main()

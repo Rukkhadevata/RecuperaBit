@@ -20,6 +20,7 @@
 
 
 from datetime import datetime, timezone, timedelta
+import logging
 
 from ..utils import printable, unpack
 
@@ -52,7 +53,7 @@ def windows_time(timestamp):
         return None
 
 
-def index_entries(dump):
+def index_entries(dump, index_root_offset: int):
     """Interpret the entries of an index."""
     offset = 0
     entries = []
@@ -65,6 +66,7 @@ def index_entries(dump):
         valid_name = has_name and len(filename['name']) > 0
         if valid_length and valid_name:
             if parsed['content_length']:
+                filename['name_content_offset'] += 16 + offset + index_root_offset # 16 from indx_dir_entry_fmt
                 entries.append(parsed)
             offset += entry_length
         else:
@@ -80,7 +82,7 @@ def index_root_parser(dump):
     """Parse the entries contained in a $INDEX_ROOT attribute."""
     header = unpack(dump, indx_header_fmt)
     offset = header['off_start_list']
-    entries = index_entries(dump[offset:])
+    entries = index_entries(dump[offset:], offset)
     return entries
 
 
@@ -112,7 +114,9 @@ def attribute_list_parser(dump):
             ('name_off', ('i', 7, 7)),
             ('start_VCN', ('i', 8, 15)),
             ('file_ref', ('i', 16, 19)),
-            ('id', ('i', 24, 24))
+            ('id', ('i', 24, 24)),
+            # ('name', ('s', lambda x:x['name_off'], lambda x:x['name_off']+x['name_length']-1))
+            ('name', (printable_name, lambda x:x['name_off'], lambda x:x['name_off']+x['name_length']*2-1)),
         ])
         length = decoded['length']
         # Check either if the length is 0 or if it is None
@@ -126,8 +130,9 @@ def attribute_list_parser(dump):
 def try_filename(dump):
     """Try to parse a $FILE_NAME attribute."""
     try:
-        unpack(dump, attr_types_fmt['$FILE_NAME'])
-    except TypeError:   # Broken attribute
+        return unpack(dump, attr_types_fmt['$FILE_NAME'])
+    except TypeError as e:   # Broken attribute
+        logging.exception('')
         return {}
 
 entry_fmt = [
@@ -262,13 +267,16 @@ attr_types_fmt = {
         ('flags', ('i', 56, 59)),
         ('name_length', ('i', 64, 64)),
         ('namespace', ('i', 65, 65)),
-        ('name', (printable_name, 66, lambda r: r['name_length']*2 + 65))
+        ('name', (printable_name, 66, lambda r: r['name_length']*2 + 65)),
+        ('name_content_offset', (lambda _: 66, 0, 0)),
+        ('name_content_bytes_len', (lambda b: 2*int.from_bytes(b, 'little', signed=False), 64, 64)),
     ],
     '$INDEX_ROOT': [
         ('attr_type', ('i', 0, 3)),
         ('sorting_rule', ('i', 4, 7)),
         ('record_bytes', ('i', 8, 11)),
         ('record_clusters', ('i', 12, 12)),
-        ('records', (index_root_parser, 16, lambda r: r['record_bytes']))
+        ('records', (index_root_parser, 16, lambda r: r['record_bytes'])),
+        ('records_offset', (lambda _: 16, 0, 0)),
     ]
 }
